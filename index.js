@@ -46,6 +46,7 @@ function tracker (opts) {
   var blockchain = opts.blockchain
   var chainHeight
   var watchedAddrs
+  var syncing
   // var watch = indexer(db, ['watch'])
 
   var init = thunky(function (cb) {
@@ -76,17 +77,9 @@ function tracker (opts) {
     blockchain.blocks.latest(function (err, info) {
       if (err) return cb(err)
 
-      chainHeight = info.blockHeight
-      db.put('chainheight', chainHeight, cb)
-    })
-  }
-
-  function getNewHeight (cb) {
-    blockchain.blocks.latest(function (err, info) {
-      if (err) return cb(err)
-
       if (chainHeight !== info.blockHeight) {
         chainHeight = info.blockHeight
+        ee.emit('height', chainHeight)
         db.put('chainheight', chainHeight, cb)
       } else {
         cb()
@@ -123,6 +116,7 @@ function tracker (opts) {
         }
       })
 
+      // not very efficient
       var addrUpdate = addrObjs.map(function (addrObj) {
         var newMaxHeight = txInfos.reduce(function (height, next) {
           return Math.max(height, next.blockHeight)
@@ -140,8 +134,6 @@ function tracker (opts) {
         return !deepEqual(addrObj, addrObjs[i])
       })
 
-      watchedAddrs = mergeAddrs(watchedAddrs, addrUpdate)
-
       var addrBatch = addrUpdate
       .map(function (addrObj) {
         return {
@@ -151,7 +143,13 @@ function tracker (opts) {
         }
       })
 
-      db.batch(txBatch.concat(addrBatch), cb)
+      db.batch(txBatch.concat(addrBatch), function (err) {
+        if (err) return cb(err)
+
+        watchedAddrs = mergeAddrs(watchedAddrs, addrUpdate)
+        ee.emit('sync', addrUpdate)
+        cb()
+      })
     })
   }
 
@@ -255,13 +253,19 @@ function tracker (opts) {
   }
 
   ee.sync = function sync (cb) {
+    if (syncing) throw new Error('already syncing')
+
+    syncing = true
     init(function () {
-      // var oldHeight = chainHeight
+      var oldHeight = chainHeight
       syncHeight(function () {
         // if (chainHeight === oldHeight) return cb()
         // can't skip resync as we have have gotten new addresses to watch
 
-        syncAddresses(watchedAddrs, cb)
+        syncAddresses(watchedAddrs, function (err) {
+          syncing = false
+          cb(err)
+        })
       })
     })
   }
