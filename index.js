@@ -1,3 +1,4 @@
+var EventEmitter = require('events').EventEmitter
 var typeforce = require('typeforce')
 var collect = require('stream-collector')
 var thunky = require('thunky')
@@ -19,15 +20,28 @@ var BATCH_SIZE = 50
 exports = module.exports = tracker
 exports.mkBatches = mkBatches
 exports.parseTx = parseTx
+exports.mergeAddrs = mergeAddrs
+exports.CONFIRMED_AFTER = 7
 
 function tracker (opts) {
   typeforce({
     db: 'Object',
     blockchain: 'Object',
-    networkName: 'String'
+    networkName: 'String',
+    confirmedAfter: '?Number'
   }, opts)
 
   var db = opts.db
+  if (db.options.valueEncoding !== 'json') {
+    throw new Error('expected db with valueEncoding "json"')
+  }
+
+  var ee = new EventEmitter()
+
+  var confirmedAfter = typeof opts.confirmedAfter === 'number'
+    ? opts.confirmedAfter :
+    exports.CONFIRMED_AFTER
+
   var networkName = opts.networkName
   var blockchain = opts.blockchain
   var chainHeight
@@ -36,119 +50,26 @@ function tracker (opts) {
 
   var init = thunky(function (cb) {
     parallel([
-      function (cb) {
+      function (done) {
         collectStuff(prefixes.address, function (err, addrs) {
           watchedAddrs = addrs || []
-          cb()
+          done()
         })
       },
-      function (cb) {
+      function (done) {
         db.get('chainheight', function (err, height) {
           chainHeight = height || 0
-          cb()
+          done()
         })
       }
     ], cb)
   })
-
-  function watchAddresses (addrs, cb) {
-    init(function () {
-      watchedAddrs = merge(watchedAddrs || [], addrs)
-      storeNew(addrs, prefixes.address, newAddressObj, cb || noop)
-    })
-  }
-
-  // function watchTxs (txs, cb) {
-  //   init(function () {
-  //     watched.tx = merge(watched.tx || [], txs)
-  //     storeNew(watchedTxs, prefixes.tx, newTxObj, cb || noop)
-  //   })
-  // }
-
-  function getWatchedAddresses (cb) {
-    init(function () {
-      cb(null, watchedAddrs)
-    })
-  }
-
-  function getTxs (addr, cb) {
-    init(function () {
-      if (typeof addr === 'function') {
-        return collectStuff(prefix.tx, cb)
-      }
-
-      var match = _getAddress(addr)
-      if (match) {
-        getTxsForAddress(match, cb)
-      } else {
-        return process.nextTick(function () {
-          cb(new Error('not found'))
-        })
-      }
-    })
-  }
-
-  function _getAddress (addr) {
-    return find(watchedAddrs, function (addrObj) {
-      return addrObj.address === addr
-    })
-  }
-
-  function getAddress (addr, cb) {
-    init(function () {
-      var match = _getAddress(addr)
-      if (match) {
-        cb(null, match)
-      } else {
-        process.nextTick(function () {
-          cb(new Error('not found'))
-        })
-      }
-    })
-  }
-
-  function getAddressWithTxs (addr, cb) {
-    db.get(prefix.address + addr, addr, function (err, addrObj) {
-      if (err) return cb(err)
-
-      getAddressTxs(addrObj.txIds, function (err, txs) {
-        if (err) return cb(err)
-
-        addrObj.txs = txs
-        cb(null, addrObj)
-      })
-    })
-  }
-
-  function getAddressTxs (txIds, cb) {
-    parallel(
-      addrObj.txIds.map(function (txId) {
-        return db.get.bind(db, prefix.tx + txId, cb)
-      }),
-      cb
-    )
-  }
-
-  function getHeight (cb) {
-    init(function () {
-      cb(null, chainHeight)
-    })
-  }
 
   function collectStuff (prefix, cb) {
     collect(db.createReadStream({
       gt: prefix,
       lt: prefix + '\xff'
     }), cb)
-  }
-
-  function sync (cb) {
-    var oldHeight = chainHeight
-    syncHeight(function () {
-      if (chainHeight === oldHeight) return cb()
-
-      syncAddresses(watchedAddrs, cb)
-    })
   }
 
   function syncHeight (cb) {
@@ -174,17 +95,21 @@ function tracker (opts) {
   }
 
   function syncAddresses (addrs, cb) {
-    parallel(mkBatches(addrs).map(function (batch) {
-      return function (cb) {
-        runBatch(batch, cb)
-      }
-    }), cb)
+    init(function () {
+      parallel(mkBatches(addrs, chainHeight).map(function (batch) {
+        return function (cb) {
+          runBatch(batch, cb)
+        }
+      }), cb)
+    })
   }
 
   function runBatch (addrObjs, cb) {
     var addrStrs = addrObjs.map(getProp('address'))
-    blockchain.addresses.transactions(addrStrs, addrObjs.minHeight, function (err, txInfos) {
+    var minHeight = addrObjs[0].maxBlockHeight - confirmedAfter
+    blockchain.addresses.transactions(addrStrs, minHeight, function (err, txInfos) {
       if (err) return cb(err)
+      if (!txInfos.length) return cb()
 
       txInfos = txInfos.map(function (info) {
         return parseTx(info, networkName)
@@ -193,28 +118,36 @@ function tracker (opts) {
       var txBatch = txInfos.map(function (tx) {
         return {
           type: 'put',
-          key: prefix.tx + tx.txId,
+          key: prefixes.tx + tx.txId,
           value: tx
         }
       })
 
-      var addrBatch = addrObjs.map(function (addr) {
-        return extend(addr, {
-          maxBlockHeight: addr.maxBlockHeight,
-          txIds: merge(
-            getTxsForAddress(txInfos, addr.address),
-            addr.txIds
+      var addrUpdate = addrObjs.map(function (addrObj) {
+        var newMaxHeight = txInfos.reduce(function (height, next) {
+          return Math.max(height, next.blockHeight)
+        }, 0)
+
+        return extend(addrObj, {
+          maxBlockHeight: Math.max(addrObj.maxBlockHeight, newMaxHeight),
+          txIds: mergeShallow(
+            filterByAddr(txInfos, addrObj.address),
+            addrObj.txIds
           )
         })
       })
-      .filter(function (addr, i) {
-        return !deepEqual(addr, addrObjs[i])
+      .filter(function (addrObj, i) {
+        return !deepEqual(addrObj, addrObjs[i])
       })
-      .map(function (addr) {
+
+      watchedAddrs = mergeAddrs(watchedAddrs, addrUpdate)
+
+      var addrBatch = addrUpdate
+      .map(function (addrObj) {
         return {
           type: 'put',
-          key: prefix.address + addr.address,
-          value: address
+          key: prefixes.address + addrObj.address,
+          value: addrObj
         }
       })
 
@@ -222,15 +155,118 @@ function tracker (opts) {
     })
   }
 
-  return {
-    watchAddresses: watchAddresses,
-    watchedAddresses: getWatchedAddresses,
-    address: getAddress,
-    addressWithTxs: getAddressWithTxs,
-    txs: getTxs,
-    sync: sync,
-    chainHeight: getHeight
+  function _getAddress (addr) {
+    return find(watchedAddrs, function (addrObj) {
+      return addrObj.address === addr
+    })
   }
+
+  ee.watchAddresses = function watchAddresses (addrs, cb) {
+    init(function () {
+      addrs = addrs.filter(function (addr) {
+        return !_getAddress(addr)
+      })
+
+      if (!addrs.length) return cb()
+
+      var addrObjs = addrs.map(newAddressObj)
+      watchedAddrs = mergeAddrs(watchedAddrs || [], addrObjs)
+      db.batch(addrObjs.map(function (addrObj) {
+        return {
+          type: 'put',
+          key: prefixes.address + addrObj.address,
+          value: addrObj
+        }
+      }), cb)
+    })
+  }
+
+  // function watchTxs (txs, cb) {
+  //   init(function () {
+  //     watched.tx = mergeShallow(watched.tx || [], txs)
+  //     storeNew(watchedTxs, prefixes.tx, newTxObj, cb || noop)
+  //   })
+  // }
+
+  ee.getWatchedAddresses = function getWatchedAddresses (cb) {
+    init(function () {
+      cb(null, watchedAddrs)
+    })
+  }
+
+  ee.getTxs = function getTxs (addr, cb) {
+    init(function () {
+      if (typeof addr === 'function') {
+        return collectStuff(prefixes.tx, cb)
+      }
+
+      var match = _getAddress(addr)
+      if (match) {
+        ee.lookupTxs(match.txIds, cb)
+      } else {
+        return process.nextTick(function () {
+          cb(new Error('not found'))
+        })
+      }
+    })
+  }
+
+  ee.getAddress = function getAddress (addr, cb) {
+    init(function () {
+      var match = _getAddress(addr)
+      if (match) {
+        cb(null, match)
+      } else {
+        process.nextTick(function () {
+          cb(new Error('not found'))
+        })
+      }
+    })
+  }
+
+  ee.getAddressWithTxs = function getAddressWithTxs (addr, cb) {
+    db.get(prefixes.address + addr, addr, function (err, addrObj) {
+      if (err) return cb(err)
+
+      ee.lookupTxs(addrObj.txIds, function (err, txs) {
+        if (err) return cb(err)
+
+        addrObj.txs = txs
+        cb(null, addrObj)
+      })
+    })
+  }
+
+  ee.lookupTxs = function lookupTxs (txIds, cb) {
+    parallel(
+      txIds.map(function (txId) {
+        return function (done) {
+          db.get(prefixes.tx + txId, done)
+        }
+      }),
+      cb
+    )
+  }
+
+  ee.getHeight = function getHeight (cb) {
+    init(function () {
+      cb(null, chainHeight)
+    })
+  }
+
+  ee.sync = function sync (cb) {
+    init(function () {
+      // var oldHeight = chainHeight
+      syncHeight(function () {
+        // if (chainHeight === oldHeight) return cb()
+        // can't skip resync as we have have gotten new addresses to watch
+
+        syncAddresses(watchedAddrs, cb)
+      })
+    })
+  }
+
+  return ee
 }
 
 function truthy (obj) {
@@ -252,42 +288,39 @@ function newTxObj (txId) {
   }
 }
 
-
-function getNonExistant (keys, prefix) {
-  parallel(
-    keys.map(function (key) {
-      return function (cb) {
-        db.get(prefix + key, function (err) {
-          cb(null, err && err.notFound)
-        })
+function mergeAddrs (left, right) {
+  left = left.slice().sort(byAddress)
+  right = right.slice().sort(byAddress)
+  var i, j
+  var merged = []
+  while (left.length && right.length) {
+    var l = left[0]
+    var r = right[0]
+    if (l.address !== r.address) {
+      merged.push(l)
+      left.shift()
+    } else {
+      if (l.maxBlockHeight >= r.maxBlockHeight) {
+        merged.push(l)
+      } else {
+        merged.push(r)
       }
-    }),
-    function (err, results) {
-      if (err) return cb(err)
 
-      cb(null, keys.filter(function (k, i) {
-        return results[i]
-      }))
+      left.shift()
+      right.shift()
     }
-  )
+  }
+
+  merged = merged.concat(left, right) // leftovers
+  return merged
 }
 
-function storeNew (ids, prefix, newObjFn, cb) {
-  getNonExistant(ids, prefix, function (err, newcomers) {
-    if (err) return cb(err)
-
-    db.batch(newcomers.map(function (id) {
-      return {
-        type: 'put',
-        key: prefix + id,
-        value: newObjFn(id)
-      }
-    }), cb)
-  })
+function byAddress (a, b) {
+  return a.address < b.address ? -1 : 1
 }
 
-function merge (arr, add) {
-  arr = arr.concat(add.filter(function (addr) {
+function mergeShallow (arr, add) {
+  return arr.concat(add.filter(function (addr) {
     return arr.indexOf(addr) === -1
   }))
 }
@@ -303,20 +336,24 @@ function getProp (prop) {
 }
 
 function parseTx (txInfo, networkName) {
+  typeforce('String', txInfo.txHex)
+  if (!(networkName in bitcoin.networks)) {
+    throw new Error('invalid networkName')
+  }
+
   var tx = bitcoin.Transaction.fromHex(txInfo.txHex)
-  var fromPubKeys = getInputPubKeys(tx)
   return extend(txInfo, {
-    from: parseTxSender(tx),
+    from: parseTxSender(tx, networkName),
     to: {
-      addresses: getOutputAddresses(tx)
+      addresses: getOutputAddresses(tx, networkName)
     }
   })
 }
 
-function parseTxSender (tx) {
+function parseTxSender (tx, networkName) {
   var pubkeys = []
   var addrs = []
-  tx.inputs.map(function (input) {
+  tx.ins.map(function (input) {
     var pubKeyBuf = input.script.chunks[1]
     try {
       var pub = bitcoin.ECPubKey.fromBuffer(pubKeyBuf)
@@ -338,14 +375,14 @@ function getTxAddresses (tx, networkName) {
 }
 
 function getOutputAddresses (tx, networkName) {
-  return tx.outputs.map(function (output) {
+  return tx.outs.map(function (output) {
     return getAddressFromOutput(output, networkName)
   })
   .filter(truthy)
 }
 
 // function getInputAddresses (tx, networkName) {
-//   return tx.inputs.map(function (input) {
+//   return tx.ins.map(function (input) {
 //     return getAddressFromInput(input, networkName)
 //   })
 //   .filter(truthy)
@@ -368,17 +405,20 @@ function getAddressFromOutput (output, networkName) {
   }
 }
 
-function getTxsForAddress (txInfos, addr) {
+function filterByAddr (txInfos, addr) {
   return txInfos.filter(function (txInfo) {
-    return txInfo.addresses.indexOf(addr) !== -1
+    return txInfo.from.addresses.indexOf(addr) !== -1 ||
+      txInfo.to.addresses.indexOf(addr) !== -1
   })
   .map(getProp('txId'))
 }
 
-function mkBatches (addrObjs) {
+function mkBatches (addrObjs, chainHeight, batchSize) {
+  batchSize = batchSize || BATCH_SIZE
+
   // sort by increasing height
   addrObjs = addrObjs.filter(function (addr) {
-    return addr.maxBlockHeight === chainHeight
+    return addr.maxBlockHeight < chainHeight
   })
 
   addrObjs.sort(function (a, b) {
@@ -387,16 +427,18 @@ function mkBatches (addrObjs) {
 
   var batches = []
   while (addrObjs.length) {
-    batches.push(addrObjs.slice(0, BATCH_SIZE))
-    addrObjs = addrObjs.slice(BATCH_SIZE)
+    batches.push(addrObjs.slice(0, batchSize))
+    addrObjs = addrObjs.slice(batchSize)
   }
 
-  var togo = batches.length
-  batches.forEach(function (batch) {
-    batch.minHeight = batch.reduce(function (min, addr) {
-      return Math.min(min, addr.maxBlockHeight)
-    }, 1) - 1
-  })
+  // var togo = batches.length
+  // batches.forEach(function (batch) {
+  //   var minHeight = batch.reduce(function (min, addr) {
+  //     return Math.min(min, addr.maxBlockHeight)
+  //   }, chainHeight) - exports.CONFIRMED_AFTER
+
+  //   batch.minHeight = Math.max(minHeight, 0)
+  // })
 
   return batches
 }
